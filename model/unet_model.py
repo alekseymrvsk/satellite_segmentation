@@ -1,109 +1,87 @@
-from keras.models import Model
-from keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate, Conv2DTranspose, BatchNormalization, \
-    Dropout
+import matplotlib
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import math
+from tqdm import tqdm_notebook, tqdm
+from skimage.draw import ellipse, polygon
+
+from keras import Model
+from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from keras.models import load_model
 from keras.optimizers import Adam
-from keras.utils import plot_model
-from keras import backend
+from keras.layers import Input, Conv2D, Conv2DTranspose, MaxPooling2D, concatenate, Dropout
+from keras.losses import binary_crossentropy
+import tensorflow as tf
+import keras as keras
+
+from keras import backend as K
+
+from tqdm import tqdm_notebook
+
+w_size = 256
+train_num = 8192
+train_x = np.zeros((train_num, w_size, w_size,3), dtype='float32')
+train_y = np.zeros((train_num, w_size, w_size,1), dtype='float32')
+
+img_l = np.random.sample((w_size, w_size, 3))*0.5
+img_h = np.random.sample((w_size, w_size, 3))*0.5 + 0.5
+
+radius_min = 10
+radius_max = 30
 
 
-def unet_model(n_classes=1, im_sz=160, n_channels=8, n_filters_start=32, growth_factor=2, upconv=True,
-               class_weights=None):
-    if class_weights is None:
-        class_weights = [0.2, 0.3, 0.1, 0.1, 0.3]
-    droprate = 0.25
-    n_filters = n_filters_start
-    inputs = Input((im_sz, im_sz, n_channels))
-    conv1 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(inputs)
-    conv1 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(conv1)
-    pool1 = MaxPooling2D(pool_size=(2, 2))(conv1)
+def build_model(input_layer, start_neurons):
+    conv1 = Conv2D(start_neurons * 1, (3, 3), activation="relu", padding="same")(input_layer)
+    conv1 = Conv2D(start_neurons * 1, (3, 3), activation="relu", padding="same")(conv1)
+    pool1 = MaxPooling2D((2, 2))(conv1)
+    pool1 = Dropout(0.25)(pool1)
 
-    n_filters *= growth_factor
-    pool1 = BatchNormalization()(pool1)
-    conv2 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(pool1)
-    conv2 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(conv2)
-    pool2 = MaxPooling2D(pool_size=(2, 2))(conv2)
-    pool2 = Dropout(droprate)(pool2)
+    conv2 = Conv2D(start_neurons * 2, (3, 3), activation="relu", padding="same")(pool1)
+    conv2 = Conv2D(start_neurons * 2, (3, 3), activation="relu", padding="same")(conv2)
+    pool2 = MaxPooling2D((2, 2))(conv2)
+    pool2 = Dropout(0.5)(pool2)
 
-    n_filters *= growth_factor
-    pool2 = BatchNormalization()(pool2)
-    conv3 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(pool2)
-    conv3 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(conv3)
-    pool3 = MaxPooling2D(pool_size=(2, 2))(conv3)
-    pool3 = Dropout(droprate)(pool3)
+    conv3 = Conv2D(start_neurons * 4, (3, 3), activation="relu", padding="same")(pool2)
+    conv3 = Conv2D(start_neurons * 4, (3, 3), activation="relu", padding="same")(conv3)
+    pool3 = MaxPooling2D((2, 2))(conv3)
+    pool3 = Dropout(0.5)(pool3)
 
-    n_filters *= growth_factor
-    pool3 = BatchNormalization()(pool3)
-    conv4_0 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(pool3)
-    conv4_0 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(conv4_0)
-    pool4_1 = MaxPooling2D(pool_size=(2, 2))(conv4_0)
-    pool4_1 = Dropout(droprate)(pool4_1)
+    conv4 = Conv2D(start_neurons * 8, (3, 3), activation="relu", padding="same")(pool3)
+    conv4 = Conv2D(start_neurons * 8, (3, 3), activation="relu", padding="same")(conv4)
+    pool4 = MaxPooling2D((2, 2))(conv4)
+    pool4 = Dropout(0.5)(pool4)
 
-    n_filters *= growth_factor
-    pool4_1 = BatchNormalization()(pool4_1)
-    conv4_1 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(pool4_1)
-    conv4_1 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(conv4_1)
-    pool4_2 = MaxPooling2D(pool_size=(2, 2))(conv4_1)
-    pool4_2 = Dropout(droprate)(pool4_2)
+    # Middle
+    convm = Conv2D(start_neurons * 16, (3, 3), activation="relu", padding="same")(pool4)
+    convm = Conv2D(start_neurons * 16, (3, 3), activation="relu", padding="same")(convm)
 
-    n_filters *= growth_factor
-    conv5 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(pool4_2)
-    conv5 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(conv5)
+    deconv4 = Conv2DTranspose(start_neurons * 8, (3, 3), strides=(2, 2), padding="same")(convm)
+    uconv4 = concatenate([deconv4, conv4])
+    uconv4 = Dropout(0.5)(uconv4)
+    uconv4 = Conv2D(start_neurons * 8, (3, 3), activation="relu", padding="same")(uconv4)
+    uconv4 = Conv2D(start_neurons * 8, (3, 3), activation="relu", padding="same")(uconv4)
 
-    n_filters //= growth_factor
-    if upconv:
-        up6_1 = concatenate([Conv2DTranspose(n_filters, (2, 2), strides=(2, 2), padding='same')(conv5), conv4_1])
-    else:
-        up6_1 = concatenate([UpSampling2D(size=(2, 2))(conv5), conv4_1])
-    up6_1 = BatchNormalization()(up6_1)
-    conv6_1 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(up6_1)
-    conv6_1 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(conv6_1)
-    conv6_1 = Dropout(droprate)(conv6_1)
+    deconv3 = Conv2DTranspose(start_neurons * 4, (3, 3), strides=(2, 2), padding="same")(uconv4)
+    uconv3 = concatenate([deconv3, conv3])
+    uconv3 = Dropout(0.5)(uconv3)
+    uconv3 = Conv2D(start_neurons * 4, (3, 3), activation="relu", padding="same")(uconv3)
+    uconv3 = Conv2D(start_neurons * 4, (3, 3), activation="relu", padding="same")(uconv3)
 
-    n_filters //= growth_factor
-    if upconv:
-        up6_2 = concatenate([Conv2DTranspose(n_filters, (2, 2), strides=(2, 2), padding='same')(conv6_1), conv4_0])
-    else:
-        up6_2 = concatenate([UpSampling2D(size=(2, 2))(conv6_1), conv4_0])
-    up6_2 = BatchNormalization()(up6_2)
-    conv6_2 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(up6_2)
-    conv6_2 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(conv6_2)
-    conv6_2 = Dropout(droprate)(conv6_2)
+    deconv2 = Conv2DTranspose(start_neurons * 2, (3, 3), strides=(2, 2), padding="same")(uconv3)
+    uconv2 = concatenate([deconv2, conv2])
+    uconv2 = Dropout(0.5)(uconv2)
+    uconv2 = Conv2D(start_neurons * 2, (3, 3), activation="relu", padding="same")(uconv2)
+    uconv2 = Conv2D(start_neurons * 2, (3, 3), activation="relu", padding="same")(uconv2)
 
-    n_filters //= growth_factor
-    if upconv:
-        up7 = concatenate([Conv2DTranspose(n_filters, (2, 2), strides=(2, 2), padding='same')(conv6_2), conv3])
-    else:
-        up7 = concatenate([UpSampling2D(size=(2, 2))(conv6_2), conv3])
-    up7 = BatchNormalization()(up7)
-    conv7 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(up7)
-    conv7 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(conv7)
-    conv7 = Dropout(droprate)(conv7)
+    deconv1 = Conv2DTranspose(start_neurons * 1, (3, 3), strides=(2, 2), padding="same")(uconv2)
+    uconv1 = concatenate([deconv1, conv1])
+    uconv1 = Dropout(0.5)(uconv1)
+    uconv1 = Conv2D(start_neurons * 1, (3, 3), activation="relu", padding="same")(uconv1)
+    uconv1 = Conv2D(start_neurons * 1, (3, 3), activation="relu", padding="same")(uconv1)
 
-    n_filters //= growth_factor
-    if upconv:
-        up8 = concatenate([Conv2DTranspose(n_filters, (2, 2), strides=(2, 2), padding='same')(conv7), conv2])
-    else:
-        up8 = concatenate([UpSampling2D(size=(2, 2))(conv7), conv2])
-    up8 = BatchNormalization()(up8)
-    conv8 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(up8)
-    conv8 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(conv8)
-    conv8 = Dropout(droprate)(conv8)
+    uncov1 = Dropout(0.5)(uconv1)
+    output_layer = Conv2D(1, (1, 1), padding="same", activation="sigmoid")(uconv1)
 
-    n_filters //= growth_factor
-    if upconv:
-        up9 = concatenate([Conv2DTranspose(n_filters, (2, 2), strides=(2, 2), padding='same')(conv8), conv1])
-    else:
-        up9 = concatenate([UpSampling2D(size=(2, 2))(conv8), conv1])
-    conv9 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(up9)
-    conv9 = Conv2D(n_filters, (3, 3), activation='relu', padding='same')(conv9)
-
-    conv10 = Conv2D(n_classes, (1, 1), activation='sigmoid')(conv9)
-
-    model = Model(inputs=inputs, outputs=conv10)
-
-    def weighted_binary_crossentropy(y_true, y_pred):
-        class_loglosses = backend.mean(backend.binary_crossentropy(y_true, y_pred), axis=[0, 1, 2])
-        return backend.sum(class_loglosses * backend.constant(class_weights))
-
-    model.compile(optimizer=Adam(), loss=weighted_binary_crossentropy)
-    return model
+    return output_layer
